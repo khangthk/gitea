@@ -7,17 +7,17 @@
 
 	{{if $useMarkdownEditor}}
 		{{template "shared/combomarkdowneditor" (dict
+			"CustomInit" true
 			"ContainerClasses" "tw-hidden"
-			"MarkdownPreviewUrl" (print .root.RepoLink "/markup")
-			"MarkdownPreviewContext" .root.RepoLink
+			"MarkdownEditorContext" (ctx.MiscUtils.MarkdownEditorComment ctx.RootData.Repository)
 			"TextareaContent" .item.Attributes.value
-			"TextareaPlaceholder"  .item.Attributes.placeholder
+			"TextareaPlaceholder" .item.Attributes.placeholder
 			"DropzoneParentContainer" ".combo-editor-dropzone"
 		)}}
 
 		{{if .root.IsAttachmentEnabled}}
-		<div class="tw-mt-4 form-field-dropzone tw-hidden">
-			{{template "repo/upload" .root}}
+		<div class="tw-mt-4 form-field-dropzone tw-hidden">{{/*TODO: need to refactor the "repo/upload" template and remove this wrapper */}}
+			{{template "repo/upload" dict "UploadOptions" ctx.RootData.UploadOptions}}
 		</div>
 		{{end}}
 	{{end}}

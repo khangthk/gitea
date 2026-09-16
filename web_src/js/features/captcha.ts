@@ -4,7 +4,7 @@ export async function initCaptcha() {
   const captchaEl = document.querySelector('#captcha');
   if (!captchaEl) return;
 
-  const siteKey = captchaEl.getAttribute('data-sitekey');
+  const siteKey = captchaEl.getAttribute('data-sitekey')!;
   const isDark = isDarkTheme();
 
   const params = {
@@ -34,16 +34,10 @@ export async function initCaptcha() {
       break;
     }
     case 'm-captcha': {
-      const {default: mCaptcha} = await import(/* webpackChunkName: "mcaptcha-vanilla-glue" */'@mcaptcha/vanilla-glue');
-      mCaptcha.INPUT_NAME = 'm-captcha-response';
-      const instanceURL = captchaEl.getAttribute('data-instance-url');
-
-      mCaptcha.default({
-        siteKey: {
-          instanceUrl: new URL(instanceURL),
-          key: siteKey,
-        },
-      });
+      // ref: https://github.com/mCaptcha/glue/blob/master/packages/vanilla/README.md
+      // sample: https://github.com/mCaptcha/glue/blob/master/packages/vanilla/static/embeded.html
+      // @mcaptcha/vanilla-glue 0.1.0-rc2 auto-runs on module load, use the existing elements to render.
+      await import('@mcaptcha/vanilla-glue');
       break;
     }
     default:

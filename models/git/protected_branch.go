@@ -5,28 +5,26 @@ package git
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/models/organization"
-	"code.gitea.io/gitea/models/perm"
-	access_model "code.gitea.io/gitea/models/perm/access"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unit"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	access_model "gitea.dev/models/perm/access"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/glob"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
 
-	"github.com/gobwas/glob"
-	"github.com/gobwas/glob/syntax"
 	"xorm.io/builder"
 )
 
-var ErrBranchIsProtected = errors.New("branch is protected")
+var ErrBranchIsProtected = util.ErrorWrap(util.ErrPermissionDenied, "branch is protected")
 
 // ProtectedBranch struct
 type ProtectedBranch struct {
@@ -34,6 +32,7 @@ type ProtectedBranch struct {
 	RepoID                        int64                  `xorm:"UNIQUE(s)"`
 	Repo                          *repo_model.Repository `xorm:"-"`
 	RuleName                      string                 `xorm:"'branch_name' UNIQUE(s)"` // a branch name or a glob match to branch name
+	Priority                      int64                  `xorm:"NOT NULL DEFAULT 0"`
 	globRule                      glob.Glob              `xorm:"-"`
 	isPlainName                   bool                   `xorm:"-"`
 	CanPush                       bool                   `xorm:"NOT NULL DEFAULT false"`
@@ -44,6 +43,9 @@ type ProtectedBranch struct {
 	WhitelistDeployKeys           bool     `xorm:"NOT NULL DEFAULT false"`
 	MergeWhitelistUserIDs         []int64  `xorm:"JSON TEXT"`
 	MergeWhitelistTeamIDs         []int64  `xorm:"JSON TEXT"`
+	EnableBypassAllowlist         bool     `xorm:"NOT NULL DEFAULT false"`
+	BypassAllowlistUserIDs        []int64  `xorm:"JSON TEXT"`
+	BypassAllowlistTeamIDs        []int64  `xorm:"JSON TEXT"`
 	CanForcePush                  bool     `xorm:"NOT NULL DEFAULT false"`
 	EnableForcePushAllowlist      bool     `xorm:"NOT NULL DEFAULT false"`
 	ForcePushAllowlistUserIDs     []int64  `xorm:"JSON TEXT"`
@@ -57,12 +59,14 @@ type ProtectedBranch struct {
 	RequiredApprovals             int64    `xorm:"NOT NULL DEFAULT 0"`
 	BlockOnRejectedReviews        bool     `xorm:"NOT NULL DEFAULT false"`
 	BlockOnOfficialReviewRequests bool     `xorm:"NOT NULL DEFAULT false"`
+	BlockOnCodeownerReviews       bool     `xorm:"NOT NULL DEFAULT false"`
 	BlockOnOutdatedBranch         bool     `xorm:"NOT NULL DEFAULT false"`
 	DismissStaleApprovals         bool     `xorm:"NOT NULL DEFAULT false"`
 	IgnoreStaleApprovals          bool     `xorm:"NOT NULL DEFAULT false"`
 	RequireSignedCommits          bool     `xorm:"NOT NULL DEFAULT false"`
 	ProtectedFilePatterns         string   `xorm:"TEXT"`
 	UnprotectedFilePatterns       string   `xorm:"TEXT"`
+	BlockAdminMergeOverride       bool     `xorm:"NOT NULL DEFAULT false"`
 
 	CreatedUnix timeutil.TimeStamp `xorm:"created"`
 	UpdatedUnix timeutil.TimeStamp `xorm:"updated"`
@@ -75,7 +79,7 @@ func init() {
 // IsRuleNameSpecial return true if it contains special character
 func IsRuleNameSpecial(ruleName string) bool {
 	for i := 0; i < len(ruleName); i++ {
-		if syntax.Special(ruleName[i]) {
+		if glob.IsSpecialByte(ruleName[i]) {
 			return true
 		}
 	}
@@ -83,14 +87,20 @@ func IsRuleNameSpecial(ruleName string) bool {
 }
 
 func (protectBranch *ProtectedBranch) loadGlob() {
-	if protectBranch.globRule == nil {
-		var err error
-		protectBranch.globRule, err = glob.Compile(protectBranch.RuleName, '/')
-		if err != nil {
-			log.Warn("Invalid glob rule for ProtectedBranch[%d]: %s %v", protectBranch.ID, protectBranch.RuleName, err)
-			protectBranch.globRule = glob.MustCompile(glob.QuoteMeta(protectBranch.RuleName), '/')
-		}
-		protectBranch.isPlainName = !IsRuleNameSpecial(protectBranch.RuleName)
+	if protectBranch.isPlainName || protectBranch.globRule != nil {
+		return
+	}
+	// detect if it is not glob
+	if !IsRuleNameSpecial(protectBranch.RuleName) {
+		protectBranch.isPlainName = true
+		return
+	}
+	// now we load the glob
+	var err error
+	protectBranch.globRule, err = glob.Compile(protectBranch.RuleName, '/')
+	if err != nil {
+		log.Warn("Invalid glob rule for ProtectedBranch[%d]: %s %v", protectBranch.ID, protectBranch.RuleName, err)
+		protectBranch.globRule = glob.MustCompile(glob.QuoteMeta(protectBranch.RuleName), '/')
 	}
 }
 
@@ -198,6 +208,29 @@ func IsUserMergeWhitelisted(ctx context.Context, protectBranch *ProtectedBranch,
 	return in
 }
 
+// CanBypassBranchProtection reports whether the user can bypass branch protection checks (status checks, approvals, protected files)
+// Either a repo admin (when not blocked) or a user/team on the bypass allowlist can bypass.
+func CanBypassBranchProtection(ctx context.Context, protectBranch *ProtectedBranch, user *user_model.User, isRepoAdmin bool) bool {
+	if isRepoAdmin && !protectBranch.BlockAdminMergeOverride {
+		return true
+	}
+	if !protectBranch.EnableBypassAllowlist {
+		return false
+	}
+	if slices.Contains(protectBranch.BypassAllowlistUserIDs, user.ID) {
+		return true
+	}
+	if len(protectBranch.BypassAllowlistTeamIDs) == 0 {
+		return false
+	}
+	in, err := organization.IsUserInTeams(ctx, user.ID, protectBranch.BypassAllowlistTeamIDs)
+	if err != nil {
+		log.Error("IsUserInTeams failed: userID=%d, repoID=%d, allowlistTeamIDs=%v, err=%v", user.ID, protectBranch.RepoID, protectBranch.BypassAllowlistTeamIDs, err)
+		return false
+	}
+	return in
+}
+
 // IsUserOfficialReviewer check if user is official reviewer for the branch (counts towards required approvals)
 func IsUserOfficialReviewer(ctx context.Context, protectBranch *ProtectedBranch, user *user_model.User) (bool, error) {
 	repo, err := repo_model.GetRepositoryByID(ctx, protectBranch.RepoID)
@@ -238,7 +271,7 @@ func (protectBranch *ProtectedBranch) GetUnprotectedFilePatterns() []glob.Glob {
 
 func getFilePatterns(filePatterns string) []glob.Glob {
 	extarr := make([]glob.Glob, 0, 10)
-	for _, expr := range strings.Split(strings.ToLower(filePatterns), ";") {
+	for expr := range strings.SplitSeq(strings.ToLower(filePatterns), ";") {
 		expr = strings.TrimSpace(expr)
 		if expr != "" {
 			if g, err := glob.Compile(expr, '.', '/'); err != nil {
@@ -312,7 +345,7 @@ func GetProtectedBranchRuleByName(ctx context.Context, repoID int64, ruleName st
 	if err != nil {
 		return nil, err
 	} else if !exist {
-		return nil, nil
+		return nil, nil //nolint:nilnil // return nil to indicate that the object does not exist
 	}
 	return rel, nil
 }
@@ -323,7 +356,7 @@ func GetProtectedBranchRuleByID(ctx context.Context, repoID, ruleID int64) (*Pro
 	if err != nil {
 		return nil, err
 	} else if !exist {
-		return nil, nil
+		return nil, nil //nolint:nilnil // return nil to indicate that the object does not exist
 	}
 	return rel, nil
 }
@@ -341,6 +374,9 @@ type WhitelistOptions struct {
 
 	ApprovalsUserIDs []int64
 	ApprovalsTeamIDs []int64
+
+	BypassUserIDs []int64
+	BypassTeamIDs []int64
 }
 
 // UpdateProtectBranch saves branch protection options of repository.
@@ -381,6 +417,12 @@ func UpdateProtectBranch(ctx context.Context, repo *repo_model.Repository, prote
 	}
 	protectBranch.ApprovalsWhitelistUserIDs = whitelist
 
+	whitelist, err = updateUserWhitelist(ctx, repo, protectBranch.BypassAllowlistUserIDs, opts.BypassUserIDs)
+	if err != nil {
+		return err
+	}
+	protectBranch.BypassAllowlistUserIDs = whitelist
+
 	// if the repo is in an organization
 	whitelist, err = updateTeamWhitelist(ctx, repo, protectBranch.WhitelistTeamIDs, opts.TeamIDs)
 	if err != nil {
@@ -406,19 +448,56 @@ func UpdateProtectBranch(ctx context.Context, repo *repo_model.Repository, prote
 	}
 	protectBranch.ApprovalsWhitelistTeamIDs = whitelist
 
-	// Make sure protectBranch.ID is not 0 for whitelists
+	whitelist, err = updateTeamWhitelist(ctx, repo, protectBranch.BypassAllowlistTeamIDs, opts.BypassTeamIDs)
+	if err != nil {
+		return err
+	}
+	protectBranch.BypassAllowlistTeamIDs = whitelist
+
+	// Looks like it's a new rule
 	if protectBranch.ID == 0 {
+		// as it's a new rule and if priority was not set, we need to calc it.
+		if protectBranch.Priority == 0 {
+			var lowestPrio int64
+			// because of mssql we can not use builder or save xorm syntax, so raw sql it is
+			if _, err := db.GetEngine(ctx).SQL(`SELECT MAX(priority) FROM protected_branch WHERE repo_id = ?`, protectBranch.RepoID).
+				Get(&lowestPrio); err != nil {
+				return err
+			}
+			log.Trace("Create new ProtectedBranch at repo[%d] and detect current lowest priority '%d'", protectBranch.RepoID, lowestPrio)
+			protectBranch.Priority = lowestPrio + 1
+		}
+
 		if _, err = db.GetEngine(ctx).Insert(protectBranch); err != nil {
 			return fmt.Errorf("Insert: %v", err)
 		}
 		return nil
 	}
 
+	// update the rule
 	if _, err = db.GetEngine(ctx).ID(protectBranch.ID).AllCols().Update(protectBranch); err != nil {
 		return fmt.Errorf("Update: %v", err)
 	}
 
 	return nil
+}
+
+func UpdateProtectBranchPriorities(ctx context.Context, repo *repo_model.Repository, ids []int64) error {
+	prio := int64(1)
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		for _, id := range ids {
+			if _, err := db.GetEngine(ctx).
+				ID(id).Where("repo_id = ?", repo.ID).
+				Cols("priority").
+				Update(&ProtectedBranch{
+					Priority: prio,
+				}); err != nil {
+				return err
+			}
+			prio++
+		}
+		return nil
+	})
 }
 
 // updateApprovalWhitelist checks whether the user whitelist changed and returns a whitelist with
@@ -429,11 +508,13 @@ func updateApprovalWhitelist(ctx context.Context, repo *repo_model.Repository, c
 		return currentWhitelist, nil
 	}
 
+	prUserIDs, err := access_model.GetUserIDsWithAnyUnitAccess(ctx, repo, perm.AccessModeRead, unit.TypePullRequests)
+	if err != nil {
+		return nil, err
+	}
 	whitelist = make([]int64, 0, len(newWhitelist))
 	for _, userID := range newWhitelist {
-		if reader, err := access_model.IsRepoReader(ctx, repo, userID); err != nil {
-			return nil, err
-		} else if !reader {
+		if !prUserIDs.Contains(userID) {
 			continue
 		}
 		whitelist = append(whitelist, userID)
@@ -456,9 +537,9 @@ func updateUserWhitelist(ctx context.Context, repo *repo_model.Repository, curre
 		if err != nil {
 			return nil, fmt.Errorf("GetUserByID [user_id: %d, repo_id: %d]: %v", userID, repo.ID, err)
 		}
-		perm, err := access_model.GetUserRepoPermission(ctx, repo, user)
+		perm, err := access_model.GetIndividualUserRepoPermission(ctx, repo, user)
 		if err != nil {
-			return nil, fmt.Errorf("GetUserRepoPermission [user_id: %d, repo_id: %d]: %v", userID, repo.ID, err)
+			return nil, fmt.Errorf("GetIndividualUserRepoPermission [user_id: %d, repo_id: %d]: %v", userID, repo.ID, err)
 		}
 
 		if !perm.CanWrite(unit.TypeCode) {
@@ -479,7 +560,7 @@ func updateTeamWhitelist(ctx context.Context, repo *repo_model.Repository, curre
 		return currentWhitelist, nil
 	}
 
-	teams, err := organization.GetTeamsWithAccessToRepo(ctx, repo.OwnerID, repo.ID, perm.AccessModeRead)
+	teams, err := organization.GetTeamsWithAccessToAnyRepoUnit(ctx, repo.OwnerID, repo.ID, perm.AccessModeRead, unit.TypeCode, unit.TypePullRequests)
 	if err != nil {
 		return nil, fmt.Errorf("GetTeamsWithAccessToRepo [org_id: %d, repo_id: %d]: %v", repo.OwnerID, repo.ID, err)
 	}

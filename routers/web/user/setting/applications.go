@@ -6,26 +6,28 @@ package setting
 
 import (
 	"net/http"
+	"strings"
 
-	auth_model "code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/models/db"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/forms"
+	audit_model "gitea.dev/models/audit"
+	auth_model "gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/modules/web"
+	"gitea.dev/services/audit"
+	"gitea.dev/services/context"
+	"gitea.dev/services/forms"
 )
 
 const (
-	tplSettingsApplications base.TplName = "user/settings/applications"
+	tplSettingsApplications templates.TplName = "user/settings/applications"
 )
 
 // Applications render manage access token page
 func Applications(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("settings.applications")
 	ctx.Data["PageIsSettingsApplications"] = true
-	ctx.Data["UserDisabledFeatures"] = user_model.DisabledFeaturesWithLoginType(ctx.Doer)
 
 	loadApplicationsData(ctx)
 
@@ -34,23 +36,34 @@ func Applications(ctx *context.Context) {
 
 // ApplicationsPost response for add user's access token
 func ApplicationsPost(ctx *context.Context) {
-	form := web.GetForm(ctx).(*forms.NewAccessTokenForm)
-	ctx.Data["Title"] = ctx.Tr("settings")
+	form := web.GetForm[*forms.NewAccessTokenForm](ctx)
+	ctx.Data["Title"] = ctx.Tr("settings_title")
 	ctx.Data["PageIsSettingsApplications"] = true
-	ctx.Data["UserDisabledFeatures"] = user_model.DisabledFeaturesWithLoginType(ctx.Doer)
 
-	if ctx.HasError() {
-		loadApplicationsData(ctx)
-
-		ctx.HTML(http.StatusOK, tplSettingsApplications)
-		return
+	_ = ctx.Req.ParseForm()
+	var scopeNames []string
+	const accessTokenScopePrefix = "scope-"
+	for k, v := range ctx.Req.Form {
+		if strings.HasPrefix(k, accessTokenScopePrefix) {
+			scopeNames = append(scopeNames, v...)
+		}
 	}
 
-	scope, err := form.GetScope()
+	scope, err := auth_model.AccessTokenScope(strings.Join(scopeNames, ",")).Normalize()
 	if err != nil {
 		ctx.ServerError("GetScope", err)
 		return
 	}
+	if !scope.HasPermissionScope() {
+		ctx.Flash.Error(ctx.Tr("settings.at_least_one_permission"), true)
+	}
+
+	if ctx.HasError() {
+		loadApplicationsData(ctx)
+		ctx.HTML(http.StatusOK, tplSettingsApplications)
+		return
+	}
+
 	t := &auth_model.AccessToken{
 		UID:   ctx.Doer.ID,
 		Name:  form.Name,
@@ -68,10 +81,32 @@ func ApplicationsPost(ctx *context.Context) {
 		return
 	}
 
+	// a token-authenticated request must not mint a token with a broader scope than its own, nor
+	// drop the public-only restriction. Web routes accept basic-auth PATs/OAuth tokens too, so this
+	// must mirror the REST API guard in routers/api/v1/user/app.go.
+	apiTokenScope, hasApiTokenScope := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+	if hasApiTokenScope {
+		hasScope, err := apiTokenScope.CanCreateChildScope(t.Scope)
+		if err != nil {
+			ctx.ServerError("CanCreateChildScope", err)
+			return
+		}
+		if !hasScope {
+			ctx.HTTPError(http.StatusForbidden, "cannot create an access token with a broader scope than the authenticating token")
+			return
+		}
+		if t.Scope, err = t.Scope.EnforcePublicOnlyFrom(apiTokenScope); err != nil {
+			ctx.ServerError("EnforcePublicOnlyFrom", err)
+			return
+		}
+	}
+
 	if err := auth_model.NewAccessToken(ctx, t); err != nil {
 		ctx.ServerError("NewAccessToken", err)
 		return
 	}
+
+	audit.Record(ctx, audit_model.UserAccessTokenAdd, ctx.Doer, "token", t.Name, "token_scope", t.Scope)
 
 	ctx.Flash.Success(ctx.Tr("settings.generate_token_success"))
 	ctx.Flash.Info(t.Token)
@@ -81,12 +116,29 @@ func ApplicationsPost(ctx *context.Context) {
 
 // DeleteApplication response for delete user access token
 func DeleteApplication(ctx *context.Context) {
-	if err := auth_model.DeleteAccessTokenByID(ctx, ctx.FormInt64("id"), ctx.Doer.ID); err != nil {
+	t, err := auth_model.GetAccessTokenByID(ctx, ctx.FormInt64("id"), ctx.Doer.ID)
+	if err != nil {
+		ctx.Flash.Error("GetAccessTokenByID: " + err.Error())
+	} else if err := auth_model.DeleteAccessTokenByID(ctx, t.ID, ctx.Doer.ID); err != nil {
 		ctx.Flash.Error("DeleteAccessTokenByID: " + err.Error())
 	} else {
+		audit.Record(ctx, audit_model.UserAccessTokenRemove, ctx.Doer, "token", t.Name)
+
 		ctx.Flash.Success(ctx.Tr("settings.delete_token_success"))
 	}
 
+	ctx.JSONRedirect(setting.AppSubURL + "/user/settings/applications")
+}
+
+// RegenerateAccessToken response for regenerating a user's access token
+func RegenerateAccessToken(ctx *context.Context) {
+	t, err := auth_model.RegenerateAccessToken(ctx, ctx.FormInt64("id"), ctx.Doer.ID)
+	if err != nil {
+		ctx.ServerError("RegenerateAccessToken", err)
+		return
+	}
+	ctx.Flash.Success(ctx.Tr("settings.generate_token_success"))
+	ctx.Flash.Info(t.Token)
 	ctx.JSONRedirect(setting.AppSubURL + "/user/settings/applications")
 }
 
@@ -99,7 +151,14 @@ func loadApplicationsData(ctx *context.Context) {
 	}
 	ctx.Data["Tokens"] = tokens
 	ctx.Data["EnableOAuth2"] = setting.OAuth2.Enabled
-	ctx.Data["IsAdmin"] = ctx.Doer.IsAdmin
+
+	// Handle specific ordered token categories for admin or non-admin users
+	tokenCategoryNames := auth_model.GetAccessTokenCategories()
+	if !ctx.Doer.IsAdmin {
+		tokenCategoryNames = util.SliceRemoveAll(tokenCategoryNames, "admin")
+	}
+	ctx.Data["TokenCategories"] = tokenCategoryNames
+
 	if setting.OAuth2.Enabled {
 		ctx.Data["Applications"], err = db.Find[auth_model.OAuth2Application](ctx, auth_model.FindOAuth2ApplicationsOptions{
 			OwnerID: ctx.Doer.ID,

@@ -7,11 +7,12 @@ package user
 import (
 	"net/http"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/context"
-	"code.gitea.io/gitea/services/convert"
+	activities_model "gitea.dev/models/activities"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
+	feed_service "gitea.dev/services/feed"
 )
 
 // Search search users
@@ -57,24 +58,24 @@ func Search(ctx *context.APIContext) {
 	uid := ctx.FormInt64("uid")
 	var users []*user_model.User
 	var maxResults int64
-	var err error
-
-	switch uid {
-	case user_model.GhostUserID:
-		maxResults = 1
-		users = []*user_model.User{user_model.NewGhostUser()}
-	case user_model.ActionsUserID:
-		maxResults = 1
-		users = []*user_model.User{user_model.NewActionsUser()}
-	default:
-		users, maxResults, err = user_model.SearchUsers(ctx, &user_model.SearchUserOptions{
+	if uid < 0 {
+		_, sysUser, _ := user_model.GetPossibleUserByID(ctx, uid)
+		if sysUser != nil && sysUser.ID == uid {
+			maxResults = 1
+			users = []*user_model.User{sysUser}
+		}
+	} else {
+		opts := user_model.SearchUserOptions{
 			Actor:         ctx.Doer,
 			Keyword:       ctx.FormTrim("q"),
 			UID:           uid,
-			Type:          user_model.UserTypeIndividual,
+			Types:         []user_model.UserType{user_model.UserTypeIndividual},
 			SearchByEmail: true,
 			ListOptions:   listOptions,
-		})
+		}
+		opts.ApplyPublicOnly(ctx.PublicOnly)
+		var err error
+		users, maxResults, err = user_model.SearchUsers(ctx, opts)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, map[string]any{
 				"ok":    false,
@@ -84,7 +85,7 @@ func Search(ctx *context.APIContext) {
 		}
 	}
 
-	ctx.SetLinkHeader(int(maxResults), listOptions.PageSize)
+	ctx.SetLinkHeader(maxResults, listOptions.PageSize)
 	ctx.SetTotalCountHeader(maxResults)
 
 	ctx.JSON(http.StatusOK, map[string]any{
@@ -103,7 +104,7 @@ func GetInfo(ctx *context.APIContext) {
 	// parameters:
 	// - name: username
 	//   in: path
-	//   description: username of user to get
+	//   description: username of the user whose data is to be listed
 	//   type: string
 	//   required: true
 	// responses:
@@ -114,7 +115,7 @@ func GetInfo(ctx *context.APIContext) {
 
 	if !user_model.IsUserVisibleToViewer(ctx, ctx.ContextUser, ctx.Doer) {
 		// fake ErrUserNotExist error message to not leak information about existence
-		ctx.NotFound("GetUserByName", user_model.ErrUserNotExist{Name: ctx.PathParam(":username")})
+		ctx.APIErrorNotFound()
 		return
 	}
 	ctx.JSON(http.StatusOK, convert.ToUser(ctx, ctx.ContextUser, ctx.Doer))
@@ -144,7 +145,7 @@ func GetUserHeatmapData(ctx *context.APIContext) {
 	// parameters:
 	// - name: username
 	//   in: path
-	//   description: username of user to get
+	//   description: username of the user whose heatmap is to be obtained
 	//   type: string
 	//   required: true
 	// responses:
@@ -155,7 +156,7 @@ func GetUserHeatmapData(ctx *context.APIContext) {
 
 	heatmap, err := activities_model.GetUserHeatmapDataByUser(ctx, ctx.ContextUser, ctx.Doer)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetUserHeatmapDataByUser", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.JSON(http.StatusOK, heatmap)
@@ -170,7 +171,7 @@ func ListUserActivityFeeds(ctx *context.APIContext) {
 	// parameters:
 	// - name: username
 	//   in: path
-	//   description: username of user
+	//   description: username of the user whose activity feeds are to be listed
 	//   type: string
 	//   required: true
 	// - name: only-performed-by
@@ -207,10 +208,11 @@ func ListUserActivityFeeds(ctx *context.APIContext) {
 		Date:            ctx.FormString("date"),
 		ListOptions:     listOptions,
 	}
+	opts.ApplyPublicOnly(ctx.PublicOnly)
 
-	feeds, count, err := activities_model.GetFeeds(ctx, opts)
+	feeds, count, err := feed_service.GetFeeds(ctx, opts)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetFeeds", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.SetTotalCountHeader(count)
